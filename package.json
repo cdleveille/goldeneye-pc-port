@@ -1,0 +1,9 @@
+{
+  "name": "goldeneye-pc-port",
+  "private": true,
+  "scripts": {
+    "assets": "mkdir -p data && cp baserom.u.z64 data/ge007.ntsc-final.z64 && python3 tools_pc/d43_emit.py ntsc-final && python3 tools_pc/d69_emit.py ntsc-final && python3 tools_pc/d88_emit.py ntsc-final --regen",
+    "build": "./build-pc.sh ntsc-final",
+    "start": "./build-pc/ge007.x86_64"
+  }
+}
