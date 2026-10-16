@@ -1,8 +1,18 @@
 # Unlocked FPS Plan
 
-Status: **proposal, parked** — documented while audio work (project Phase 3) is
-active. Do not start Phase 0 until audio is done; first action when resumed is
-the Phase 0 measurement pass.
+Status: **superseded by D573 (2026-10-16)** — frame interpolation is built
+(`Video.Interpolation`, experimental, off by default). The "Non-goals" and
+"Parked" sections below assumed interpolation needed per-entity state in the
+DL-building game code; it did not. fast3d blends every vertex batch's
+transform between ticks (the camera is already folded into the game's
+matrices, and model matrices load through segment 3, so batches can be matched
+across ticks), the render worker redraws each display list at the display
+rate, and game timing is untouched. Design, limits and verification:
+`docs/dev/findings.md` D573. The text below is kept as the historical plan.
+
+Previous status: **proposal, parked** — documented while audio work (project
+Phase 3) is active. Do not start Phase 0 until audio is done; first action when
+resumed is the Phase 0 measurement pass.
 
 **M-119 note:** this plan's premise below ("default preset = ~30fps") is now
 stale — **D248** (M-118) found and fixed a real port bug (a pointer-width

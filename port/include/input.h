@@ -41,6 +41,18 @@ int  inputConnectedMask(void);
  * mouse-aim accumulator maintained by inputUpdate(). */
 unsigned inputComputePad(int idx, signed char *stick_x, signed char *stick_y);
 
+/* D573 (frame interpolation): render worker -- seat-0 direct mouse look the
+ * game has applied so far (running totals, degrees) and what the next poll
+ * will add from unread motion; returns 0 when the direct look path is off. */
+int  inputPredictLook(double *totalYaw, double *totalPitch, float *pendYaw, float *pendPitch);
+/* D573: display-list submit -- the running totals alone. */
+void inputLookTotals(double *totalYaw, double *totalPitch);
+/* D573 test probe (GE_INTERP_FAKEMOUSE): host-thread event pump hook. */
+void inputFakeMousePump(void);
+/* D573: host thread, after pumping events -- with mouse-look prediction on,
+ * moves SDL's relative motion into the pool the pad poll and renderer share. */
+void inputPumpMouse(void);
+
 /* Grab/release the mouse (relative-mouse mode). The host event pump calls
  * this on window focus loss/gain so alt-tabbing frees the cursor. A release
  * also suspends mouse-aim reads until re-grabbed. No-op if the mouse is

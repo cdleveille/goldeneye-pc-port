@@ -60,6 +60,9 @@
 /* fast3d (C++): the software RSP entry point. */
 extern void gfx_run(Gfx *commands);
 extern void videoSyncSplitScreen(void); /* D416 */
+#include "gfx_interp.h"                 /* D573 */
+#include "sched.h"                      /* D573: OSScTask (src/sched.h) */
+extern void portInterpSnapshot(GfxInterpFrame *f, const void *dl);   /* port/src/interp.c */
 
 /* ------------------------------------------------------------------------ */
 /* Globals the game expects to exist (normally set by osInitialize).        */
@@ -586,8 +589,11 @@ void osEnqueueMesg(OSMesgQueue *mq, OSMesg msg)
     pthread_mutex_unlock(&pq->lock);
 }
 
+static void portInterpOnSubmit(OSMesgQueue *mq, OSMesg msg);   /* D573, render-worker section */
+
 s32 osSendMesg(OSMesgQueue *mq, OSMesg msg, s32 flag)
 {
+    portInterpOnSubmit(mq, msg);   /* D573: no-op unless a gfx task goes to the scheduler */
     PortQueue *pq = portQueueGet(mq);
     pthread_mutex_lock(&pq->lock);
     while (mq->validCount >= mq->msgCount) {
@@ -1278,10 +1284,232 @@ static pthread_mutex_t s_rwLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_rwCond = PTHREAD_COND_INITIALIZER;
 static Gfx *s_rwTask = NULL;   /* submitted display list; NULL = worker idle */
 static int s_rwMode = 0;       /* 0 = undecided, 1 = worker, -1 = inline */
+static GfxInterpFrame s_rwInfo;   /* D573: game-state snapshot submitted with s_rwTask */
+static int s_rwInfoValid = 0;
+static int s_rwBusy = 0;   /* D573: the worker is inside a draw (guarded by s_rwLock) */
+static int s_rwHold = 0;   /* D573: no extra draws until the next display list arrives */
+static pthread_t s_rwThread;
+static int s_rwThreadSet = 0;
+
+/* D573: game thread, before it touches renderer state directly (the stage-load
+ * texture-cache reset, boss.c -> videoResetTextureCache). The game only gets
+ * there with no task pending, so before interpolation the worker was idle;
+ * with it, the worker may still be redrawing the last list. Stop that and wait
+ * out a draw in progress; the next submitted list lifts the hold. */
+void portRenderQuiesce(void)
+{
+    if (s_rwMode != 1 || (s_rwThreadSet && pthread_equal(pthread_self(), s_rwThread))) {
+        return;   /* inline rendering, or already on the worker */
+    }
+    pthread_mutex_lock(&s_rwLock);
+    s_rwHold = 1;
+    const int waited = s_rwBusy;
+    const uint64_t t0 = sysGetMicroseconds();
+    while (s_rwBusy) {
+        pthread_cond_wait(&s_rwCond, &s_rwLock);
+    }
+    pthread_mutex_unlock(&s_rwLock);
+    if (waited) {
+        sysLogPrintf(LOG_NOTE, "D573: stage load waited %llu us for a draw in progress",
+                     (unsigned long long)(sysGetMicroseconds() - t0));
+    }
+}
+
+/* D573: the snapshot is taken on the game thread as it hands a finished
+ * display list to the scheduler (rsp.c rspGfxTaskStart -> osSendMesg on
+ * sched_cmdQ), not when the scheduler starts the task: the scheduler only
+ * collects new tasks at the next VI retrace, after that retrace's controller
+ * poll has already written the next tick's mouse look into the player (and
+ * sometimes later still, when the previous task is still drawing). Two slots
+ * keyed by display list (a list can be built while the previous one waits). */
+extern OSMesgQueue *sched_cmdQ;   /* src/init.c */
+static pthread_mutex_t s_snapLock = PTHREAD_MUTEX_INITIALIZER;
+static struct { const void *dl; GfxInterpFrame f; } s_snap[2];
+static int s_snapNext;
+
+static void portInterpOnSubmit(OSMesgQueue *mq, OSMesg msg)
+{
+    if (mq == NULL || mq != sched_cmdQ || msg == NULL || s_rwMode != 1 || !videoInterpolationOn()) {
+        return;
+    }
+    const OSScTask *st = (const OSScTask *)msg;
+    if (st->list.t.type != M_GFXTASK) {
+        return;   /* audio tasks share the queue */
+    }
+    GfxInterpFrame f;
+    portInterpSnapshot(&f, (const void *)st->list.t.data_ptr);
+    pthread_mutex_lock(&s_snapLock);
+    s_snap[s_snapNext].dl = (const void *)st->list.t.data_ptr;
+    s_snap[s_snapNext].f = f;
+    s_snapNext ^= 1;
+    pthread_mutex_unlock(&s_snapLock);
+}
+
+static int portInterpTakeSnapshot(const void *dl, GfxInterpFrame *f)
+{
+    int found = 0;
+    pthread_mutex_lock(&s_snapLock);
+    for (int i = 0; i < 2; i++) {
+        if (s_snap[i].dl != NULL && s_snap[i].dl == dl) {
+            *f = s_snap[i].f;
+            s_snap[i].dl = NULL;
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&s_snapLock);
+    return found;
+}
+
+/* D573: frame interpolation (Video.Interpolation), render worker only. After
+ * the first draw of a display list -- which posts the done events exactly as
+ * before, so the game's timing is untouched -- the worker keeps drawing the
+ * same list, paced by VSync or the frame cap, with fast3d blending every
+ * transform from the previous list toward this one by the wall time since it
+ * was submitted (port/include/gfx_interp.h), until the next list arrives. */
+static struct {
+    int have;          /* the last list may be drawn again */
+    Gfx *dl;
+    GfxInterpFrame f;
+    int32_t prevSim;   /* sim tick of the previous list */
+    double prevLookYaw, prevLookPitch;   /* its mouse-look totals */
+    int prevValid;
+    float spanUs;      /* game time this list advanced: ticks x tick length */
+    int slowLogged;
+    GfxInterpPass last;   /* the last draw's parameters (GE_INTERP_LOG=2 trace) */
+} s_ip;
+
+/* GE_INTERP_LOG=2: one line per draw -- start/end relative to the list's
+ * submission, blend factor, mouse look of the list and predicted on top. */
+static void portInterpTrace(const char *kind, uint64_t t0)
+{
+    if (gfx_interp_log_level() < 2 || !s_ip.prevValid) {
+        return;
+    }
+    const uint64_t t1 = sysGetMicroseconds();
+    sysLogPrintf(LOG_NOTE, "D573 draw %s sim=%d start=%.2f end=%.2f a=%.3f m=%.3f pend=%.3f",
+                 kind, (int)s_ip.f.sim_tick,
+                 (double)(int64_t)(t0 - s_ip.f.submit_us) / 1000.0,
+                 (double)(int64_t)(t1 - s_ip.f.submit_us) / 1000.0,
+                 (double)s_ip.last.alpha, (double)s_ip.f.look_yaw_deg, (double)s_ip.last.pend_yaw_deg);
+}
+
+static float portInterpAlpha(uint64_t now)
+{
+    if (s_ip.spanUs <= 0.0f) {
+        return 1.0f;
+    }
+    const float a = (float)(int64_t)(now - s_ip.f.submit_us) / s_ip.spanUs;
+    return a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+}
+
+/* Mouse look the list does not show yet: applied to the player since it was
+ * submitted (it belongs to the next list), plus motion no poll has read. */
+static int portInterpPendingLook(float *yaw, float *pitch)
+{
+    double ty, tp;
+    float py, pp;
+    const int ok = inputPredictLook(&ty, &tp, &py, &pp);
+    *yaw = (float)(ty - s_ip.f.look_total_yaw) + py;
+    *pitch = (float)(tp - s_ip.f.look_total_pitch) + pp;
+    return ok;
+}
+
+static void portInterpMakePass(GfxInterpPass *p)
+{
+    p->alpha = portInterpAlpha(sysGetMicroseconds());
+    p->predict = 0;
+    p->pend_yaw_deg = p->pend_pitch_deg = 0.0f;
+    if (videoInterpolationMouseLook() && s_ip.f.look_cam >= 0) {
+        p->predict = portInterpPendingLook(&p->pend_yaw_deg, &p->pend_pitch_deg);
+    }
+    s_ip.last = *p;
+}
+
+/* Draw the last list again now? While it is still blending toward this tick,
+ * or while unread mouse motion turns the view. Never later than two ticks
+ * after it was submitted: the game rebuilds into that memory once it has
+ * submitted the next list (we stop as soon as that arrives), and a list that
+ * late means a hitch, where holding the image is what interpolation-off does. */
+static int portInterpWantPass(void)
+{
+    if (!s_ip.have || !videoInterpolationOn()) {
+        return 0;
+    }
+    const uint64_t now = sysGetMicroseconds();
+    if (now - s_ip.f.submit_us > 2u * (uint64_t)g_tickIntervalUs) {
+        return 0;
+    }
+    if (portInterpAlpha(now) < 1.0f) {
+        return 1;
+    }
+    if (videoInterpolationMouseLook() && s_ip.f.look_cam >= 0) {
+        float y, p;
+        if (portInterpPendingLook(&y, &p) && (y != 0.0f || p != 0.0f)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void portInterpBeginList(Gfx *dl, const GfxInterpFrame *info)
+{
+    s_ip.have = 0;
+    if (info == NULL) {
+        if (s_ip.prevValid) {
+            gfx_interp_disable();
+        }
+        s_ip.prevValid = 0;
+        return;
+    }
+    int32_t dticks = s_ip.prevValid ? info->sim_tick - s_ip.prevSim : 1;
+    if (dticks < 1 || dticks > 8) {
+        dticks = 1;
+    }
+    s_ip.f = *info;
+    s_ip.dl = dl;
+    s_ip.spanUs = (float)dticks * (float)g_tickIntervalUs;
+    /* the mouse look this list adds over the previous one */
+    s_ip.f.look_yaw_deg = s_ip.prevValid ? (float)(info->look_total_yaw - s_ip.prevLookYaw) : 0.0f;
+    s_ip.f.look_pitch_deg = s_ip.prevValid ? (float)(info->look_total_pitch - s_ip.prevLookPitch) : 0.0f;
+    s_ip.prevSim = info->sim_tick;
+    s_ip.prevLookYaw = info->look_total_yaw;
+    s_ip.prevLookPitch = info->look_total_pitch;
+    s_ip.prevValid = 1;
+    GfxInterpPass pass;
+    portInterpMakePass(&pass);
+    gfx_interp_new_frame(&s_ip.f, &pass);
+}
+
+static void portInterpAfterFirstDraw(void)
+{
+    if (!s_ip.prevValid) {
+        return;
+    }
+    /* A display list that takes a large part of a tick to walk leaves no room
+     * for extra draws (and is what would race the game's next build). */
+    const double ms = gfx_interp_last_dl_ms();
+    const double budget = 0.35 * (double)g_tickIntervalUs / 1000.0;
+    if (ms > budget && !s_ip.slowLogged) {
+        s_ip.slowLogged = 1;
+        sysLogPrintf(LOG_WARNING, "D573: display list took %.1f ms (budget %.1f); no interpolated frames for slow lists", ms, budget);
+    }
+    s_ip.have = gfx_interp_can_replay() && ms <= budget;
+}
+
+static void portRenderGfxSubstep(Gfx *dl)
+{
+    videoStartSubFrame();
+    videoSyncSplitScreen();
+    gfx_run(dl);
+    videoEndSubFrame();
+    g_lastFrameUs = sysGetMicroseconds();
+}
 
 static void *portRenderWorker(void *arg)
 {
     (void)arg;
+    s_rwThread = pthread_self();
+    s_rwThreadSet = 1;
     for (;;) {
         pthread_mutex_lock(&s_rwLock);
         while (s_rwTask == NULL) {
@@ -1294,19 +1522,51 @@ static void *portRenderWorker(void *arg)
                 pthread_mutex_unlock(&s_rwLock);
                 for (;;) sysSleep(100000);
             }
+            if (!s_rwHold && portInterpWantPass()) {
+                break;   /* D573: draw the last list again */
+            }
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 100 * 1000 * 1000;
+            /* D573: re-check soon while a list may still be drawn again
+             * (mouse motion can start any time); a new list wakes us anyway. */
+            ts.tv_nsec += (s_ip.have ? 2 : 100) * 1000 * 1000;
             if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&s_rwCond, &s_rwLock, &ts);
         }
         Gfx *dl = s_rwTask;
+        GfxInterpFrame info;
+        const int infoValid = dl != NULL && s_rwInfoValid;
+        if (infoValid) {
+            info = s_rwInfo;
+        }
+        s_rwBusy = 1;   /* D573: portRenderQuiesce waits this out */
         pthread_mutex_unlock(&s_rwLock);
 
+        const uint64_t drawStart = sysGetMicroseconds();
+        if (dl == NULL) {   /* D573: an interpolated extra frame */
+            GfxInterpPass pass;
+            portInterpMakePass(&pass);
+            gfx_interp_replay(&pass);
+            portRenderGfxSubstep(s_ip.dl);
+            portInterpTrace("extra", drawStart);
+            if (!gfx_interp_can_replay()) {
+                s_ip.have = 0;
+            }
+            pthread_mutex_lock(&s_rwLock);
+            s_rwBusy = 0;
+            pthread_cond_broadcast(&s_rwCond);
+            pthread_mutex_unlock(&s_rwLock);
+            continue;
+        }
+
+        portInterpBeginList(dl, infoValid ? &info : NULL);
         portRenderGfxTask(dl);
+        portInterpTrace("first", drawStart);
+        portInterpAfterFirstDraw();
 
         pthread_mutex_lock(&s_rwLock);
         s_rwTask = NULL;
+        s_rwBusy = 0;
         pthread_cond_broadcast(&s_rwCond);
         pthread_mutex_unlock(&s_rwLock);
         portPostEventForce(OS_EVENT_SP);   /* D134: must not be dropped */
@@ -1363,6 +1623,15 @@ void osSpTaskStartGo(OSTask *t)
          * list). For now the task simply completes; libaudio's amMain still
          * runs its per-frame bookkeeping. */
     } else if (portRenderWorkerOn()) {
+        /* D573: with frame interpolation, the snapshot the game thread took
+         * when it submitted this list; blending is timed from now (the
+         * scheduler starts tasks on the retrace grid, a steady clock). */
+        GfxInterpFrame info;
+        const int infoValid = videoInterpolationOn() &&
+                              portInterpTakeSnapshot((const void *)t->t.data_ptr, &info);
+        if (infoValid) {
+            info.submit_us = sysGetMicroseconds();
+        }
         /* D481: hand the display list to the render worker; it posts the
          * SP/DP done events when the frame is presented. */
         pthread_mutex_lock(&s_rwLock);
@@ -1373,6 +1642,11 @@ void osSpTaskStartGo(OSTask *t)
             }
         }
         s_rwTask = (Gfx *)t->t.data_ptr;
+        s_rwInfoValid = infoValid;
+        if (infoValid) {
+            s_rwInfo = info;
+        }
+        s_rwHold = 0;   /* D573: a new list: extra draws may resume (portRenderQuiesce) */
         pthread_cond_broadcast(&s_rwCond);
         pthread_mutex_unlock(&s_rwLock);
         return;

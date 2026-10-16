@@ -31,6 +31,8 @@
 #include "envflag.h"
 
 #include "gfx_pc.h"
+#include "gfx_interp.h"       /* D573 */
+#include "gfx_interp_hooks.h" /* D573 */
 #include "gfx_cc.h"
 #include "gfx_window_manager_api.h"
 #include "gfx_rendering_api.h"
@@ -337,6 +339,25 @@ static struct GfxWindowManagerAPI* gfx_wapi;
 static struct GfxRenderingAPI* gfx_rapi;
 
 static uintptr_t segmentPointers[16];
+
+/* D573: flattened recording of a display list's first walk (frame
+ * interpolation). Replays walk this copy, not the game's memory: while they
+ * run the game is already building its next tick and rewrites per-instance
+ * model display lists, rw vertex buffers and palettes in place. Every executed
+ * command is kept in order (calls and branches walked inline); the vertices,
+ * matrices, lights/viewports and vertex colours it read are copied into a
+ * blob; other pointers (texture and frame buffer images) are kept resolved;
+ * loaded palettes are kept by load order. Texture data is not copied: the
+ * texture cache is keyed by address, so a replay hits the first walk's
+ * uploads. */
+static bool s_dl_rec = false;   /* recording the walk */
+static bool s_dl_abs = false;   /* walking a recording: every w1 pointer is absolute */
+static bool s_dl_rec_ready = false;
+static std::vector<Gfx> s_rec_gfx;
+static std::vector<uint8_t> s_rec_blob;
+static std::vector<std::pair<size_t, size_t>> s_rec_patch;   /* (command index, blob offset) */
+static std::vector<uint16_t> s_rec_tlut;
+static size_t s_rec_tlut_pos;
 
 struct FBInfo {
     uint32_t orig_width, orig_height;
@@ -1592,7 +1613,7 @@ static void gfx_matrix_mul(float res[4][4], const float a[4][4], const float b[4
     memcpy(res, tmp, sizeof(tmp));
 }
 
-static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
+static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr, uintptr_t w1) {
     float matrix[4][4];
 
     /* D144: a front-end 3D model (MISSION COMPLETE dossier, mode-select
@@ -1624,6 +1645,10 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
     // For a modified GBI where fixed point values are replaced with floats
     memcpy(matrix, addr, sizeof(matrix));
 #endif
+
+    if (interp_hooks_active()) {
+        interp_on_matrix(parameters, addr, w1, matrix);   /* D573 */
+    }
 
     if (parameters & G_MTX_PROJECTION) {
         if (parameters & G_MTX_LOAD) {
@@ -2113,6 +2138,24 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx* verti
         return; /* D146 */
     }
 
+    /* D573: with frame interpolation this batch may be transformed by blended
+     * matrices; the real ones are put back after the loop. */
+    float (*interp_mvtop)[4] = rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1];
+    float interp_mp[4][4], interp_mv[4][4], interp_saved_mp[4][4], interp_saved_mv[4][4];
+    bool interp_mv_changed = false;
+    const bool interp_swap = interp_hooks_active() &&
+        interp_on_vertex(vertices, n_vertices, interp_mvtop, rsp.P_matrix, rsp.geometry_mode,
+                         segmentPointers[5], interp_mp, interp_mv, &interp_mv_changed);
+    if (interp_swap) {
+        memcpy(interp_saved_mp, rsp.MP_matrix, sizeof(interp_saved_mp));
+        memcpy(rsp.MP_matrix, interp_mp, sizeof(interp_mp));
+        if (interp_mv_changed) {
+            memcpy(interp_saved_mv, interp_mvtop, sizeof(interp_saved_mv));
+            memcpy(interp_mvtop, interp_mv, sizeof(interp_mv));
+            rsp.lights_changed = true;
+        }
+    }
+
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const Vtx* v = &vertices[i];
         struct LoadedVertex* d = &rsp.loaded_vertices[dest_index];
@@ -2292,6 +2335,14 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx* verti
         }
 
         d->color.a = vcn->a; // can be required for SHADE_ALPHA even if fog is enabled
+    }
+
+    if (interp_swap) {   /* D573 */
+        memcpy(rsp.MP_matrix, interp_saved_mp, sizeof(interp_saved_mp));
+        if (interp_mv_changed) {
+            memcpy(interp_mvtop, interp_saved_mv, sizeof(interp_saved_mv));
+            rsp.lights_changed = true;
+        }
     }
 
 #ifdef PORT
@@ -3292,7 +3343,15 @@ extern "C" void gfx_get_ui_screen_rect(int32_t *outX, int32_t *outY, int32_t *ou
     *outH = (int32_t)area.height;
 }
 
+/* D573: the last SP viewport in N64 pixels (centre x, y, half-size x, y), for
+ * interp_on_scissor. */
+static float s_vp_raw[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
 static void gfx_calc_and_set_viewport(const Vp_t* viewport) {
+    s_vp_raw[0] = viewport->vtrans[0] / 4.0f;
+    s_vp_raw[1] = viewport->vtrans[1] / 4.0f;
+    s_vp_raw[2] = fabsf(viewport->vscale[0] / 4.0f);
+    s_vp_raw[3] = fabsf(viewport->vscale[1] / 4.0f);
     // 2 bits fraction
     float width = 2.0f * viewport->vscale[0] / 4.0f;
     float height = 2.0f * viewport->vscale[1] / 4.0f;
@@ -3368,6 +3427,14 @@ static void gfx_sp_moveword(uint8_t index, uint16_t offset, uintptr_t data) {
             // GE registers segment bases as OS_K0_TO_PHYSICAL(ptr); store the
             // live host pointer so seg_addr() resolves seg+offset correctly.
             segmentPointers[(offset >> 2) & 0xff] = (data < PORT_DRAM_SIZE) ? (data + PORT_DRAM_K0_BASE) : data;
+            if (interp_hooks_active()) {
+                interp_on_segment((offset >> 2) & 0xff, segmentPointers[(offset >> 2) & 0xff]);   /* D573 */
+            }
+            break;
+        case G_MW_PERSPNORM:   /* no effect on fast3d's float pipeline */
+            if (interp_hooks_active()) {
+                interp_on_perspnorm((uint32_t)data);   /* D573: marks the first-person gun layer */
+            }
             break;
     }
 }
@@ -3384,10 +3451,14 @@ static void gfx_sp_texture(uint16_t sc, uint16_t tc, uint8_t level, uint8_t tile
 }
 
 static void gfx_dp_set_scissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
-    float x = ulx / 4.0f;
-    float y = lry / 4.0f;
-    float width = (lrx - ulx) / 4.0f;
-    float height = (lry - uly) / 4.0f;
+    float fulx = ulx / 4.0f, fuly = uly / 4.0f, flrx = lrx / 4.0f, flry = lry / 4.0f;
+    if (interp_hooks_active()) {
+        interp_on_scissor(s_vp_raw, &fulx, &fuly, &flrx, &flry);   /* D573 */
+    }
+    float x = fulx;
+    float y = flry;
+    float width = flrx - fulx;
+    float height = flry - fuly;
 
     // D493b: with the overscan crop off (the Original N64 preset turns it
     // off) D246's 1-unit trim is off too, and its gap at the left/right
@@ -3520,8 +3591,18 @@ static void gfx_dp_load_tlut(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t 
 
     const uint16_t *src = base;
     uint16_t *dst = rdp.palette + palofs;
-    for (uint32_t i = 0; i < count; ++i) {
-        *dst++ = PD_BE16(*src++);
+    if (s_dl_abs && s_rec_tlut_pos + count <= s_rec_tlut.size()) {
+        /* D573: a replay loads the palette its first walk loaded (same source
+         * address, so the texture cache key is unchanged). */
+        memcpy(dst, s_rec_tlut.data() + s_rec_tlut_pos, count * sizeof(uint16_t));
+        s_rec_tlut_pos += count;
+    } else {
+        for (uint32_t i = 0; i < count; ++i) {
+            *dst++ = PD_BE16(*src++);
+        }
+        if (s_dl_rec) {
+            s_rec_tlut.insert(s_rec_tlut.end(), rdp.palette + palofs, rdp.palette + palofs + count);
+        }
     }
 
     /* D217: refresh the palette-content hash that keys the CI texture cache.
@@ -4056,6 +4137,9 @@ static void gfx_sp_vertex_float(size_t n_vertices, size_t dest_index, const Port
 }
 
 static inline void *seg_addr(uintptr_t w1) {
+    if (s_dl_abs) {
+        return (void *)w1;   /* D573: a recorded walk carries resolved pointers */
+    }
     // GE model files reference GDLs (gSPDisplayList) and vertex arrays by raw
     // VMA 0x05xxxxxx WITHOUT the LSB set; segment 5 is set per-render to the
     // live host file base by the game's gSPSegment. Resolve it explicitly
@@ -4111,6 +4195,65 @@ static inline void *seg_addr(uintptr_t w1) {
     return (void *)w1;
 }
 
+/* D573: append a pointer command to the recording with a copy of the `len`
+ * bytes it reads (0 / unmapped: a null pointer, which every handler rejects
+ * the same way it rejected the original). */
+static void dlrec_ptr(const Gfx* cmd, const void* p, size_t len) {
+    Gfx g = *cmd;
+    if (!fast3d_ptr_ok(p) || len == 0) {
+        g.words.w1 = 0;
+        s_rec_gfx.push_back(g);
+        return;
+    }
+    const size_t off = ALIGN(s_rec_blob.size(), 16);
+    s_rec_blob.resize(off + len);
+    memcpy(s_rec_blob.data() + off, p, len);
+    s_rec_patch.emplace_back(s_rec_gfx.size(), off);
+    s_rec_gfx.push_back(g);
+}
+
+/* D573: record one executed command; `last` is the final word a multi-word
+ * command (texture / fill rectangles) consumed. */
+static void dlrec_note(const Gfx* first, const Gfx* last) {
+    const Gfx* cmd = first;   /* for C0() */
+    const uint32_t opcode = cmd->words.w0 >> 24;
+    switch (opcode) {
+        case G_DL:
+            return;   /* calls and branches are walked inline */
+        case G_MTX:
+            dlrec_ptr(cmd, seg_addr(cmd->words.w1), sizeof(Mtx));
+            return;
+        case G_MOVEMEM:
+            dlrec_ptr(cmd, seg_addr(cmd->words.w1), 16);   /* Vp_t / Light */
+            return;
+        case G_VTX: {
+            const size_t n = C0(0, 16) / sizeof(Vtx);
+            dlrec_ptr(cmd, seg_addr(cmd->words.w1), (C0(16, 4) + n <= MAX_VERTICES) ? n * sizeof(Vtx) : 0);
+            return;
+        }
+        case G_FLOATVTX_EXT: {
+            const size_t n = C0(0, 16);
+            dlrec_ptr(cmd, seg_addr(cmd->words.w1), (C0(16, 8) + n <= MAX_VERTICES) ? n * sizeof(PortFloatVtx) : 0);
+            return;
+        }
+        case G_COL:
+            dlrec_ptr(cmd, seg_addr(cmd->words.w1), C0(0, 16));
+            return;
+        case G_SETTIMG:
+        case G_SETZIMG:
+        case G_SETCIMG:
+        case G_INVALTEXCACHE_EXT: {
+            Gfx g = *cmd;
+            g.words.w1 = (uintptr_t)seg_addr(cmd->words.w1);
+            s_rec_gfx.push_back(g);
+            return;
+        }
+    }
+    for (; first <= last; ++first) {
+        s_rec_gfx.push_back(*first);
+    }
+}
+
 uintptr_t clearMtx;
 
 static void gfx_run_dl(Gfx* cmd) {
@@ -4124,6 +4267,7 @@ static void gfx_run_dl(Gfx* cmd) {
 
     for (;;) {
         uint32_t opcode = cmd->words.w0 >> 24;
+        Gfx* const rec_first = cmd;   /* D573 */
         // gfx_print_cmd(cmd);
         switch (opcode) {
                 // RSP commands:
@@ -4132,7 +4276,7 @@ static void gfx_run_dl(Gfx* cmd) {
                              (finding B1), so treating it as a no-op is safe. */
                 break;
             case G_MTX: {
-                gfx_sp_matrix(C0(16, 8), (const int32_t*)seg_addr(cmd->words.w1));
+                gfx_sp_matrix(C0(16, 8), (const int32_t*)seg_addr(cmd->words.w1), cmd->words.w1);
                 break;
             }
             case (uint8_t)G_POPMTX:
@@ -4173,9 +4317,14 @@ static void gfx_run_dl(Gfx* cmd) {
             case (uint8_t)G_CLEARGEOMETRYMODE:
                 gfx_sp_geometry_mode(cmd->words.w1, 0);
                 break;
-            case G_FLOATVTX_EXT: /* D245 */
-                gfx_sp_vertex_float(C0(0, 16), C0(16, 8), (const PortFloatVtx*)seg_addr(cmd->words.w1));
+            case G_FLOATVTX_EXT: { /* D245 */
+                const PortFloatVtx* fv = (const PortFloatVtx*)seg_addr(cmd->words.w1);
+                if (interp_hooks_active() && fast3d_ptr_ok(fv)) {
+                    fv = interp_on_floatvtx(fv, C0(0, 16));   /* D573: re-project the sky */
+                }
+                gfx_sp_vertex_float(C0(0, 16), C0(16, 8), fv);
                 break;
+            }
             case 0x46: /* G_HUDSCALE_EXT (D226): w0 low16 = scale*256 (0/256 = off), w1 = ax4<<16 | ay4 */
             {
                 const uint32_t sc = C0(0, 16);
@@ -4430,6 +4579,9 @@ static void gfx_run_dl(Gfx* cmd) {
                 return;
             }
         }
+        if (s_dl_rec) {
+            dlrec_note(rec_first, cmd);   /* D573 */
+        }
         ++cmd;
     }
 }
@@ -4486,8 +4638,20 @@ extern "C" struct GfxRenderingAPI* gfx_get_current_rendering_api(void) {
     return gfx_rapi;
 }
 
+static void gfx_start_frame_impl(bool events);
+
 extern "C" void gfx_start_frame(void) {
-    gfx_wapi->handle_events();
+    gfx_start_frame_impl(true);
+}
+
+extern "C" void gfx_start_frame_no_events(void) {
+    gfx_start_frame_impl(false);
+}
+
+static void gfx_start_frame_impl(bool events) {
+    if (events) {
+        gfx_wapi->handle_events();
+    }
     gfx_wapi->get_dimensions(&gfx_current_window_dimensions.width, &gfx_current_window_dimensions.height,
                              &gfx_current_window_position_x, &gfx_current_window_position_y);
 
@@ -4607,21 +4771,37 @@ static uint64_t s_perf_frames = 0, s_perf_last_start = 0;
 static double s_perf_maxiv = 0, s_perf_maxiv_dl = 0, s_perf_maxiv_run = 0;
 static uint64_t s_perf_maxiv_frame = 0, s_perf_over20 = 0, s_perf_over33 = 0;
 
+/* D573: the RSP state and segment table a display list's first draw started
+ * from, so a replay of it walks from identical state. */
+static struct RSP s_interp_rsp;
+static uintptr_t s_interp_segs[16];
+
 extern "C" void gfx_run(Gfx* commands) {
     s_hud_scale = 1.0f;   /* D226: never carry a HUD scale across frames */
     const uint64_t perf_t0 = gfx_perfstat_on() ? gfx_perf_now_ns() : 0;
     ++num_dls;
     gfx_sp_reset();
 
+    const int interp_pass = interp_pass_begin();   /* D573: -1 off, 0 first draw, 1 replay */
+    if (interp_pass == 0) {
+        s_interp_rsp = rsp;
+        memcpy(s_interp_segs, segmentPointers, sizeof(s_interp_segs));
+    } else if (interp_pass == 1) {
+        rsp = s_interp_rsp;
+        memcpy(segmentPointers, s_interp_segs, sizeof(s_interp_segs));
+    }
+
     // puts("New frame");
 
     if (!gfx_wapi->start_frame()) {
         dropped_frame = true;
+        interp_pass_end(false);
         return;
     }
     if (g_aspect_settle > 0) {   /* D509: hold the old image, see gfx_set_output_aspect */
         --g_aspect_settle;
         dropped_frame = true;
+        interp_pass_end(false);
         return;
     }
     dropped_frame = false;
@@ -4641,7 +4821,33 @@ extern "C" void gfx_run(Gfx* commands) {
     rendering_state.viewport = {};
     rendering_state.scissor = {};
     const uint64_t perf_tpre = perf_t0 ? gfx_perf_now_ns() : 0;
-    gfx_run_dl(commands);
+    if (interp_pass == 1 && s_dl_rec_ready) {
+        /* D573: replay the recorded walk, not the game's (live) memory */
+        s_dl_abs = true;
+        s_rec_tlut_pos = 0;
+        gfx_run_dl(s_rec_gfx.data());
+        s_dl_abs = false;
+    } else if (interp_pass == 0) {
+        s_rec_gfx.clear();
+        s_rec_blob.clear();
+        s_rec_patch.clear();
+        s_rec_tlut.clear();
+        s_dl_rec_ready = false;
+        s_dl_rec = true;
+        gfx_run_dl(commands);
+        s_dl_rec = false;
+        for (const auto& p : s_rec_patch) {
+            s_rec_gfx[p.first].words.w1 = (uintptr_t)(s_rec_blob.data() + p.second);
+        }
+        Gfx end;
+        end.words.w0 = (uintptr_t)(uint8_t)G_ENDDL << 24;
+        end.words.w1 = 0;
+        s_rec_gfx.push_back(end);
+        s_dl_rec_ready = true;
+    } else {
+        gfx_run_dl(commands);
+    }
+    interp_pass_end(true);   /* D573 */
     {
         Gfx* overlay = optionsOverlayEmit();
         if (overlay != nullptr) {

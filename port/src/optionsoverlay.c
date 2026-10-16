@@ -143,8 +143,12 @@ static const char *const kGameplayView[] = { "Original", "Extended", NULL };   /
  * frame-pacing wait) state exists at the config level and old inis may still
  * have it, but it's dropped from the menu: with VSync on (the default) it's
  * indistinguishable from 60, and with VSync off it just burns GPU time
- * re-presenting the same simulated frame -- confusing for no real benefit. */
-static const int         kFpsCapSeq[] = { 30, 60 };
+ * re-presenting the same simulated frame -- confusing for no real benefit.
+ * D573: Video.Interpolation draws real in-between frames, so the higher caps
+ * and Uncapped (0: VSync-paced, safety-capped without VSync) are back; above
+ * 60 they only matter with interpolation on (the row's tip says so). */
+static const int         kFpsCapSeq[] = { 30, 60, 90, 120, 144, 165, 240, 0 };
+#define FPSCAP_N ((int)(sizeof(kFpsCapSeq) / sizeof(kFpsCapSeq[0])))
 
 /* Windowed-mode resolution presets. Filtered at init to those that fit the
  * desktop; the Resolution row cycles the surviving list. */
@@ -254,6 +258,7 @@ static struct Row rows[] = {
     SEP(V2),
     { .key="Video.VSync", .label="VSync", .kind=ROW_TOGGLE, .step=1, .names=kOnOff },
     { .key="Video.FpsCap", .label="Frame rate cap", .kind=ROW_FPSCAP },
+    { .key="Video.Interpolation", .label="Frame interpolation", .kind=ROW_TOGGLE, .step=1, .names=kOnOff },   /* D573 */
     { .key="Video.DisplayFPS", .label="Show FPS", .kind=ROW_TOGGLE, .step=1, .names=kOnOff },
     SEP(V3),
     { .key="Video.TextureFilter", .label="Texture filter", .kind=ROW_ENUM, .step=1, .names=kTexFilter },
@@ -1655,11 +1660,11 @@ static void rowAdjust(struct Row *r, int dir)
         break;
     }
     case ROW_FPSCAP: {
-        int idx = 0;
-        for (int i = 0; i < 2; i++) {
+        int idx = 1;   /* an unlisted ini value steps from 60 */
+        for (int i = 0; i < FPSCAP_N; i++) {
             if (kFpsCapSeq[i] == (int)lround(v)) idx = i;
         }
-        idx = (idx + dir + 2) % 2;
+        idx = (idx + dir + FPSCAP_N) % FPSCAP_N;
         rowSetStepWatch(r, (double)kFpsCapSeq[idx]);
         break;
     }
@@ -1815,12 +1820,13 @@ static void ddBuild(const struct Row *r)
         }
         s_ddN = MSAA_N;
     } else if (r->kind == ROW_FPSCAP) {
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < FPSCAP_N && i < DD_MAX; i++) {
             s_ddVals[i] = kFpsCapSeq[i];
-            snprintf(s_ddLab[i], sizeof(s_ddLab[i]), "%d FPS", kFpsCapSeq[i]);
+            if (kFpsCapSeq[i] <= 0) snprintf(s_ddLab[i], sizeof(s_ddLab[i]), "Uncapped");
+            else snprintf(s_ddLab[i], sizeof(s_ddLab[i]), "%d FPS", kFpsCapSeq[i]);
             if (kFpsCapSeq[i] == cur) s_ddCur = i;
         }
-        s_ddN = 2;
+        s_ddN = FPSCAP_N < DD_MAX ? FPSCAP_N : DD_MAX;
     } else if (r->kind == ROW_RES) {
         for (int k = 0; k < s_resFitN && k < DD_MAX; k++) {
             int i = s_resFit[k];
@@ -2057,6 +2063,7 @@ static const struct { const char *key; double def; } kResetDefaults[] = {
     { "Video.FullscreenMode", 0 },   /* = 0 (borderless, D511) */
     { "Video.VSync",        1 }, /* = 1 (on) */
     { "Video.FpsCap",      60 }, /* = 60 */
+    { "Video.Interpolation", 0 }, /* = 0 (off, D573) */
     { "Video.DisplayFPS",   0 }, /* registered 0 */
     /* AUDIO (port/src/audio.c, D470) */
     { "Audio.MasterVolume", 100 }, /* = 100 (bit-identical passthrough) */
@@ -3758,7 +3765,9 @@ int optionsRowIsShown(int i)
  * resolution, VSync, anti-aliasing, volumes and sensitivities carry no tip). */
 static const struct { const char *key, *help; } kRowHelp[] = {
     { "__DisplayMode", "Modern, original or custom graphics presets." },
-    { "Video.AspectMode", "Fill window fits the picture to the whole window." },   /* D560: shown only while Fill window is selected (optionsRowHelp) */
+    { "Video.AspectMode", "Fill window fits the picture to the whole window." },
+    { "Video.FpsCap", "Above 60 FPS needs Frame interpolation on." },   /* D573 */
+    { "Video.Interpolation", "Smooth motion above 60 FPS. Uncaps the frame rate." },   /* D573 */   /* D560: shown only while Fill window is selected (optionsRowHelp) */
     { "Video.CrosshairHide", "When off, the crosshair stays hidden, even with Sight on screen." },
     { "Video.CrosshairPersistent", "Shows the crosshair all the time. The N64 shows it only while aiming. Off by default." },
     { "Video.CrosshairColor", "Original keeps the game's red sight. Custom: set Red, Green and Blue (0-255)." },

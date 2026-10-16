@@ -208,8 +208,12 @@ Backspace.
 - **The original look in one click:** the *Display mode* row (F10 → *Video*) switches
   between *Modern* and *Original N64* (it reads *Custom* once you edit a setting it covers),
   and *Aspect ratio → Original* shows the exact 4:3 frame.
-- **A steady 60 fps**, with VSync and a frame cap (30 or 60), including on
+- **A steady 60 fps**, with VSync and a frame cap, including on
   low-end GPUs.
+- **High refresh rates (experimental):** *Frame interpolation* (F10 → *Video*)
+  draws in-between frames for 120, 144, 240 Hz and up. The game still runs
+  at its own 60 ticks a second; mouse look turns the view at the full display
+  rate. Off by default.
 - **Graphics options:** resolution, borderless or exclusive fullscreen,
   a Center window action while windowed, MSAA (up to 16×), anisotropic
   filtering, and nearest, bilinear, trilinear or the N64's own 3-point
@@ -303,6 +307,7 @@ common keys and their defaults:
 Fullscreen = 0
 VSync = 1
 FpsCap = 60
+Interpolation = 0
 MSAA = 2
 TextureFilter = 1
 NativeWidescreen = 1
@@ -313,7 +318,11 @@ DrawDistance = 200
 MasterVolume = 100
 ```
 
-`Fullscreen` 1 is borderless fullscreen; `TextureFilter` is 0 nearest,
+`Fullscreen` 1 is borderless fullscreen; `FpsCap` 0 is uncapped (paced by
+VSync); `Interpolation` 1 turns on frame interpolation, which only helps
+with `FpsCap` above 60 or 0 on a display faster than 60 Hz
+(`InterpolationMouseLook = 0` blends mouse look like everything else
+instead of turning the view at the display rate); `TextureFilter` is 0 nearest,
 1 bilinear, 2 the N64 3-point filter, 3 trilinear; `FovScale` and `DrawDistance` are
 percentages of the original (the options overlay shows the field of view in
 degrees). On Atom/Celeron-class GPUs the first launch writes lighter values

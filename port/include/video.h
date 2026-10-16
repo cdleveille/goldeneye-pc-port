@@ -39,6 +39,12 @@ void videoDestroy(void);
 void videoStartFrame(void);
 void videoSubmitCommands(Gfx *cmds);   /* runs the software RSP on the list */
 void videoEndFrame(void);
+/* D573: the same, around an extra (interpolated) draw of a display list that
+ * was already drawn: presented, but not counted as a game frame. */
+void videoStartSubFrame(void);
+void videoEndSubFrame(void);
+int  videoInterpolationOn(void);          /* Video.Interpolation */
+int  videoInterpolationMouseLook(void);   /* Video.InterpolationMouseLook */
 
 /* Host-thread SDL event pump: keeps the window responsive (Windows only
  * dispatches messages to the creating thread) and handles quit. Called in a

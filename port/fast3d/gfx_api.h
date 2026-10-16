@@ -41,6 +41,10 @@ void gfx_init(const struct GfxInitSettings *settings);
 void gfx_destroy(void);
 struct GfxRenderingAPI* gfx_get_current_rendering_api(void);
 void gfx_start_frame(void);
+/* D573: as gfx_start_frame, without pumping window events (interpolated
+ * frames: the host thread pumps; SDL/Wayland event dispatch is not
+ * thread-safe, and these come at the display's rate). */
+void gfx_start_frame_no_events(void);
 void gfx_run(Gfx* commands);
 void gfx_end_frame(void);
 void gfx_set_target_fps(int);

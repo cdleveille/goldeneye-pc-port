@@ -153,6 +153,7 @@ mupen64/
 run_*.log
 d6*.log
 ge007.crash.log
+interp.log
 
 # agent scratch space + audio probe artifacts (regenerable dumps/traces)
 scratchpad/

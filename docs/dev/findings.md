@@ -723,6 +723,7 @@ covers D24–D69; the log continues in §H (D32 procedure, D70–D121).
 | D570 | **Scaled crosshair (Crosshair size != 100%) showed a faint copy of the top bar's tip under the bottom bar (WRAP tile flags)** — full `## D570` entry at file tail | FIXED 2026-10-06 (port only: CLAMP when scaled in `gunDrawSight` + F10 pointer; 100% unchanged, Dam gate PASS) |
 | D571 | **Project icon restyled to the in-game sight red as pixel art (exe, window, favicon)** — full `## D571` entry at file tail | CHANGED 2026-10-06 (maintainer request; make_icon.py; social preview unchanged) |
 | D572 | **Linux tarball glibc floor lowered from 2.38 to 2.31: CI builds in the Steam Runtime sniper container with SDL2 2.30.0 from source** — full `## D572` entry at file tail | CHANGED 2026-10-07 (maintainer request; packaging only; X220 glibc 2.36 fresh install PASS) |
+| D573 | **Frame interpolation above 60 fps (`Video.Interpolation`): the render worker redraws each display list at the display rate, fast3d blends every transform from the previous tick, mouse look predicted at the display rate** — full `## D573` entry at file tail | ADDED 2026-10-16 (port only, experimental, off by default; off path A/B-identical; live feel on high-refresh displays owed) |
 | D407 | **Tanks cannot be boarded/exited on PC — the v0.4.0 use/reload split (D378/D393) removed the B-button tap the engine's tank handlers in `bondview2.c` consume (user report 2026-09-28, Runway/Streets)** — full `## D407` entry at file tail | **CLOSED (2026-09-28 bookkeeping: tank board/exit accepted by the user; shipped in v0.4.0).** Earlier: PARTIAL (fix landed in v0.4.0, port-only): present `GE_CONT_B` on the use (E / pad A) rising edge only while `g_PlayerIsInTank == 1` or `g_BondCanEnterTank != 0`; E keeps its D378 no-reload-fallback semantics elsewhere, N64 layout unaffected. D407(b) same cycle: front PC Options page-edge highlight clamp + mouse-wheel / W-S paging (wheel queue consumed on the menu, D223); its wheel mapping shipped inverted and was fixed to match W/S (wheel up = step up). D407(c): board-animation lockout, menu-accept B gate in tank states, in-tank aim routed through the legacy velocity stick + `Input.TankAimScale` knob. RESOLVED 2026-09-28: all port-only (src/game zero-diff), 10 TANKDBG probes stripped, release binary verified clean, user live tank drive signed off (board + exit OK, aim feel good). |
 | D408 | **`Game.SkipIntro` skips the post-mission failure dossier: with it on, entering a level then aborting (watch Z+A) or dying (KIA) returns straight to the menus — no REPORT / "Mission status: KILLED IN ACTION / ABORTED" screen** (user report 2026-09-28; save/AllUnlocked ruled out) — full `## D408` entry at file tail | FIXED 2026-09-30 (SkipIntro hook gated to first boot; live dossier check owed). |
 | D415 | **Shooting a light fixture does not "kill" its flickering light (Bunker, Caverns): the fixture takes the hit but the flicker keeps going (community report, issue #87 comment by the reporter, 2026-09-28, 00 Agent playthrough of v0.4.0).** — full `## D415` entry at file tail | FIXED (2026-09-29 bookkeeping: root-caused and fixed as D430 + D431, user-verified vs GEPD/1964 on Caverns 2026-09-29; #119). Earlier: ROOT-CAUSED as D430 (see there); fix in tree, live check owed. |
@@ -18417,3 +18418,292 @@ CI-built tarball (run 37623073542, c45dece7, the v0.5.0 packaging): floor
 X220 (Fedora 37, glibc 2.36: the box the 24.04 tarball refused to start on) and
 the Steam Deck; the 21-level pixel gate ran on that binary on both, 21/21 PASS
 each. Shipped in v0.5.0.
+
+## D573: Frame interpolation above 60 fps (`Video.Interpolation`) — ADDED 2026-10-16 (port only, experimental, off by default)
+
+**Ask (fork maintainer, 2026-10-16):** render above 60 fps (up to 240) on
+high-refresh displays. **Why a cap change alone cannot do it:** the game
+advances in whole 60 Hz ticks (`g_ClockTimer`, no sub-tick unit, unlike PD's
+240 Hz `lvupdate240`) and builds one display list per tick
+(`waitForNextFrame` rounds every frame to >= 1 tick; `boss.c` gates the main
+loop on half a frame), so a faster retrace only speeds the game up. The
+remaining route is drawing in-between frames from the ticks the game produces.
+`UNLOCKED-FPS-PLAN.md` had parked that as needing per-entity state in the
+DL-building game code; it does not.
+
+**Design (no `src/` edits).** The render worker (D481) draws each display
+list once as before -- SP/DP done is posted right after, so the game's timing,
+the scheduler handshake and netplay determinism are untouched -- and then keeps
+redrawing the same list, paced by VSync or the frame cap, until the next list
+arrives. Each draw blends every vertex batch's transform between the previous
+tick and this one by `alpha` = wall time since submission / game time the list
+advanced (`sim_tick` delta x tick length). Pieces:
+- **Snapshot at submit** (`port/src/interp.c`, taken on the game thread in
+  `osSendMesg` to the scheduler's command queue; see the field report): per player,
+  the projection and projection x view `Mtx` pointers the list loads
+  (`projmatrix`, `field_10E0`), the world-to-camera matrix (`field_10CC`), the
+  stage, the per-tick pool ranges. Pointers are accepted only inside the
+  submitted list's half of the vtx pool (no stale matrices); front end: no
+  scene cameras.
+- **Recording** (`port/fast3d/gfx_interp.cpp`, hooks in `gfx_pc.cpp`): every
+  `G_MTX` value + classification (scene projection / projection x view /
+  other, by pointer after folding the V1/KSEG0 DRAM alias), segment 3 changes
+  (one model instance per `render_pos` base; signature = segment 5, the model
+  file), one record per `G_VTX` with its camera-space transform C
+  (`MV x P_slot x P^-1`) and world transform W (`C x V^-1`). Level geometry's
+  floating room origin (`bgroomtrans.c`) cancels in C, so blending never
+  bridges a room-change jump.
+- **Matching:** model instances to the previous tick's by signature and
+  nearest world anchor (survives draw-order changes), then batches by ordinal
+  within the instance (skin-seam batches with per-tick vertex copies included);
+  other batches by (camera, vertex source, occurrence). Pairs that moved over
+  400 units or turned over ~115 degrees in a tick snap. 95-100% of batches match
+  in gameplay.
+- **Blending:** the camera is slerped/lerped from the two view matrices;
+  matched world batches blend W (quaternion slerp + scale/translation lerp)
+  and draw with the blended camera; unmatched world batches (effects built
+  fresh each tick) keep their newest W under the blended camera; the
+  first-person gun and hands (drawn under their own `G_MW_PERSPNORM` value)
+  and z-buffer-off batches are camera-anchored and blend in camera space;
+  non-scene batches (menus, watch) blend MV and projection.
+  Camera cuts (>400 units or >70 degrees in a tick), stage changes and odd
+  tick gaps disable blending for that list.
+- **Sky:** `sky.c` projects its fans on the CPU (`G_FLOATVTX_EXT`), so they are
+  re-projected by the camera's rotation change (exact at infinity), and edge
+  vertices -- the fan is clipped to this tick's screen edges -- are refilled
+  from the sky plane (s/w, t/w, 1/w affine in screen space). Pinning them
+  instead kept coverage but froze the texture (measured: sky moved 1.3 px per
+  in-between draw against 6.2 px for the world).
+- **Replays walk a recording, not game memory.** First runs re-walked the
+  game's list and diverged/read garbage (`D146 unknown GBI opcode`, 17 ms after
+  submit): GE rewrites per-instance model DLs, rw vertex buffers and palettes
+  in place while building the next tick. fast3d now records the first walk
+  flattened (calls/branches inline; bytes behind `G_VTX`/`G_MTX`/`G_MOVEMEM`/
+  `G_COL`/`G_FLOATVTX_EXT` copied; image pointers resolved; loaded palettes
+  kept by load order) and replays that; the texture cache is address-keyed, so
+  replays hit the first walk's uploads. RSP state and segments are restored to
+  the first walk's starting state. Porting-notes D26.
+- **Mouse look at the display rate** (`Video.InterpolationMouseLook`, on): the
+  view also turns by mouse look the newest list does not show yet: what the
+  game has applied since the list was submitted (input.c keeps running
+  totals, so it never drops out between a poll and the list built from it --
+  a per-poll value made the view jump back one tick of motion every tick) plus
+  motion no poll has read (SDL motion pulled under the input spinlock, scaled
+  by the factors the last direct-look poll used); this tick's mouse part is
+  shown at once rather than blended. Only seat 0, single player, direct-look
+  path (hipfire and Centered aim); off in GEPD crosshair aim. Signs checked
+  against the game: the heading change the game produced vs the yaw it applied
+  agree (e.g. -40.20 vs -40.74 degrees over a second).
+
+**Settings.** `Video.Interpolation` (F10 -> Video -> Frame interpolation;
+turning it on lifts a 30/60 cap to Uncapped), `Video.InterpolationMouseLook`
+(ini only). The frame cap row is 30/60/90/120/144/165/240/Uncapped again (D319's
+{30, 60} predates this); interpolation only engages with a cap above 60 or
+Uncapped; with VSync off and Uncapped it is capped at 500. The F10 overlay
+draws outside interpolation; its FPS counter counts presented frames.
+`GE_PCDUMP`/`GE_QUITFRAME` count game frames only. `GE_DETERM` and
+`GE_RENDERINLINE` (no render worker) keep it off. Probes: `GE_INTERP_LOG`,
+`GE_INTERP_DUMP` (GE-ENV-PROBES.md).
+
+**Verified (Linux, CachyOS, 240 Hz display):**
+- Off path: Dam 1500-1700 captured with this build and a baseline build of the
+  previous commit at the same window size: 3/3 frames within threshold, 25-44
+  px differing (0.008-0.014%, the documented Dam run-to-run noise). (The
+  committed 640x480 goldens could not be used on this desktop: the window
+  manager resized the window run to run.)
+- On: 4.00 draws per tick at 240 Hz, first-walk cost 1-2 ms; zero replay
+  divergence and zero D146 after the recording change. Measured image motion
+  during a constant stick turn: -7.4 to -7.8 px every draw on Dam, across tick
+  boundaries included (30 px once per tick without interpolation); Surface 1
+  looking up: sky -2.1 to -2.3 px and trees -3.5 px every draw, no uncovered
+  edge in any draw.
+- `tools_pc/interptest.cpp` (standalone, no game data) checks the math.
+- 21-level sweep (interpolation on, VSync, Uncapped, ~900 frames each with
+  stick turns right/left/forward): 21/21 exit 0, no crash log, 0 replay
+  divergences, 0 D146; 3.96-4.00 draws per tick; batches matched to the
+  previous tick, mean per level 92.1% (Caverns) to 99.5% (Cuba), lowest
+  one-second window 77.8% (Caverns; the rest are effects built fresh each
+  tick, which follow the camera by design); one camera cut per level (intro
+  to gameplay); first-walk cost at most 4.3 ms (Frigate).
+- Split-screen 2P (`GE_STARTMP=2 GE_MPVIRT=1`, stage 38, no `-level`):
+  4.00 draws per tick, 99.5-100% matched, both viewports blend with their own
+  camera. The dark triangle in P2's view at frame 500 is the pre-existing
+  D423 arrowhead (the baseline build draws it too).
+- The off-path A/B was repeated on the final build (after the recording
+  change): same 25-35 px Dam noise.
+
+**Known limits.** Effects built fresh each tick (explosions, smoke, sparks,
+impacts) move at 60 under a smoothly moving camera; vertex-animated geometry
+not driven by matrices likewise. Display latency grows by up to one tick for
+everything except predicted mouse look. A guard whose instance cannot be
+matched (LOD switch, draw-order swap beyond the match radius) shows its newest
+pose for that tick. CI-palette content rewritten between the first walk and
+a replay is covered by the palette recording; texture data evicted from
+fast3d's cache in between would be re-read live. Not yet run: Windows/Deck
+builds, live feel with a mouse and pad at 120/144/240 Hz, a 60 Hz display
+(interpolation should be left off there: it can only add latency).
+
+**Field report (fork maintainer, 2026-10-16, Dam, 3200x1800 borderless,
+MSAA 4x, VSync, cap 240, 240 Hz display): "mouse look feels smooth, but the
+whole level shakes constantly."** Not reproducible with scripted stick turns
+(those measured smooth). Investigated with a per-draw trace (`GE_INTERP_LOG=2`)
+and a synthetic mouse that arrives through the host event pump like a real one
+(`GE_INTERP_FAKEMOUSE`). Three defects found, all in the mouse-prediction path:
+- **The first-person gun and hands were treated as world geometry.** This port
+  draws them with the z-buffer on, so the "z-buffer off = camera-attached" rule
+  never fired: they got the camera blend and the predicted mouse turn, i.e. the
+  gun swung across the screen by up to one tick of mouse motion, varying every
+  draw (with the gun as the eye's reference, the world appears to shake). The
+  gun is now recognised by the `G_MW_PERSPNORM` value it is drawn under
+  (gunfire.c sets its own around the gun, fr.c sets the scene's right after the
+  projection) and blended in camera space. Measured at a 0-900 px/s varying
+  mouse: gun movement between consecutive draws, median 0.38 -> 0.05 px at
+  3200 px (the rest is the game's own gun sway, D428); 58 view-model batches
+  per frame on Dam.
+- **The snapshot was taken one controller poll late.** The scheduler collects
+  a submitted task only at the next VI retrace (sched.c `__scHandleRetrace`),
+  after that retrace's `joyPoll` has already written the next tick's mouse look
+  into the player, so the mouse total attached to a list was one poll ahead of
+  its camera. The snapshot is now taken on the game thread as it submits
+  (`osSendMesg` on `sched_cmdQ`, rsp.c), keyed by display list; blending is
+  still timed from the scheduler's start (a steady retrace-grid clock).
+- **SDL's relative mouse state was read and reset from the render thread** (up
+  to ~500 Hz) while the host thread pumped events into it; SDL does not make
+  that safe. With prediction on, the host thread now moves the motion into the
+  locked pool after each pump (`inputPumpMouse`); the pad poll and the renderer
+  read only the pool. (Prediction off: unchanged.)
+
+Also measured, not a D573 defect: the game's own camera heading wobbles near a
+heading of 180 degrees (0.16-0.64 deg per tick while `vv_theta` advances an
+exact 0.333) through the head-animation offset; interpolation shows it as
+smoothly as the game produces it. After the fixes, a varying-speed synthetic
+mouse gives per-draw heading jerk p99 0.066 deg (was 0.156) with 0 divergences.
+The maintainer's retest still shook, equally with mouse prediction off: the
+main cause was in the world-transform reconstruction (next report).
+
+**Crash (fork maintainer, 2026-10-16): "corrupted double-linked list", SIGABRT
+when starting Dam from the menu.** Backtrace: `gfx_texture_cache_clear` (std::list
+clear) on the game thread, from boss.c's stage-load texture-cache reset
+(`videoResetTextureCache`, D235). The game only reaches a stage load with no gfx
+task pending, so before D573 the render worker was always idle there; with
+interpolation the worker keeps redrawing the last display list after posting
+done, using the same texture cache, so the two threads modified the cache's
+map/list at once. Reproduced (menu briefing -> START -> Dam, interpolation on):
+1 crash in 7 runs on the pre-fix binary, the other variant a SIGSEGV in a
+texture-cache lookup inside `portRenderGfxSubstep`. Fix: `portRenderQuiesce`
+(libultra.c), called by `videoResetTextureCache` before the clear, holds off
+further interpolated draws and waits out the one in progress; the next
+submitted display list lifts the hold (guarded against being called on the
+worker itself). Verified: 8/8 menu -> Dam transitions clean on the fixed build,
+and every one logged "stage load waited ~4.1 ms for a draw in progress", i.e.
+the overlap happened each time and is now serialised. Interpolation off: the
+worker is idle at a stage load, so the quiesce returns without waiting.
+
+**Field report (fork maintainer, 2026-10-16): "at the start of Dam pretty much
+every wall and asset in view jitters constantly; the start of Facility is almost
+smooth, a little jitter here and there; the same with
+`Video.InterpolationMouseLook` 0 or 1."** The maintainer's `GE_INTERP_LOG=2`
+trace showed nothing wrong in timing or the camera: draws evenly spaced
+(4.1-4.2 ms apart at 240 Hz, blend factors 0.20/0.45/0.70/0.95), camera
+position advancing in equal steps, 96% of batches matched, yaw seen = applied.
+A per-second stat added for this (`bg-drift`: how far a matched static level
+batch's reconstructed world origin moves between ticks) measured 10-15 world
+units mean, ~40 max per tick while walking on Dam, where it should be ~0. Two
+defects, both in turning a batch's camera-space transform C into a world
+transform W = C x V^-1:
+- **The stage's visibility scale was not part of the camera.** Rooms and models
+  are drawn in a camera space scaled by `levelinfotable[].visibility` (0.2 on
+  Dam and Surface 1/2, 1.0 elsewhere): the room matrices (bgroomtrans.c) and the
+  model matrices (`bondviewTransformManyPosToViewMatrix`) go through
+  `matrix_4x4_f32_to_s32` with `D_80032310[0] = 65536 x visibility`, and the
+  level view `field_10E0` is built from `(cam - current_model_pos) x
+  D_800364CC` (bondview2.c). The snapshot used the unscaled `field_10CC`, so W
+  held `(1 - s) x cam` and was only right where the blend happened to cancel it
+  (matched pairs); any batch drawn from this tick's W with the blended camera
+  (unmatched ones) was off by `4 x` the camera's in-tick movement on Dam, and
+  exactly 0 on Facility. Fix: `portInterpSnapshot` multiplies V's output
+  columns by `D_800364CC`.
+- **A homogeneous scale was dropped after being multiplied out to world
+  coordinates.** Level geometry's C is the fixed-point projection x view over
+  the fixed-point projection; `P_float x P_fixed^-1` is not exactly identity in
+  its depth terms, so C carries a homogeneous w of 0.998-1.004 that changes
+  every tick as the view turns. Harmless in the game's own path (the w cancels
+  in the projection), but W = C x V^-1 multiplied it into the absolute camera
+  position (~20000 on Dam), and the affine blend then dropped it (its
+  tolerance is 1e-3): 20-40 world units of error per batch, different every
+  tick and every draw. Reproduced offline at Dam coordinates: a static wall up
+  to 13.8 px off at 1080p, varying draw to draw (2.7 px with the scale fix
+  alone). Fix: C is divided by its own w (projection-invariant) and W is kept
+  relative to its tick's camera position (C times the inverse of V's rotation
+  and scale only); the previous tick's W is moved to this tick's origin by the
+  camera offset before blending, and the displayed view is built relative to
+  this tick's camera. Large magnitudes no longer enter the blend. Facility's
+  "a little jitter" was the same defect at smaller world coordinates.
+
+Measured after the fix (`bg-drift`, now the angle between where the two ticks'
+transforms place a static batch, and `bg-err`, the on-screen offset of a
+blended static batch from where the displayed camera sees it, 1080p pixels):
+Dam walking, 3 runs: drift <= 0.07 mrad, error <= 0.08 px (mean <= 0.006);
+Facility, Surface 1, Runway (synthetic mouse turning): drift <= 0.006 mrad,
+error 0.00 px. `tools_pc/interptest.cpp` case 8 is the Dam scenario (scaled
+camera, per-tick w error inside the affine tolerance, wall at (18900, 757,
+16517)): < 0.05 px at every blend factor.
+
+**Crash found while measuring: SIGSEGV in `wl_list_remove`** (libwayland,
+from SDL's event pump) on the render worker, once (the 5th Dam run of this
+investigation; none in the earlier 21-level sweep). fast3d's
+`gfx_start_frame` pumps window events (`handle_events`); the render worker has
+always done that once per display list (D481) while the host thread pumps too,
+and interpolation made it 4x as frequent. SDL/Wayland event dispatch is not
+thread-safe. Interpolated frames now start with `gfx_start_frame_no_events`
+(the host thread keeps pumping); the first draw of each list is unchanged.
+Afterwards 0 crashes in 10 runs (Dam x7, Facility, Surface 1, Runway). The 60 Hz
+worker pump is a pre-existing (D481) instance of the same race, left as is.
+
+**Field report (fork maintainer, 2026-10-16, after the fix above): "much
+better; looking around quickly with the mouse, some assets (or just their
+edges) disappear for a split second and the blue background shows."** Two
+render-side causes, both from drawing a view the display list was not built
+for (the predicted view runs up to about one tick of mouse motion ahead of the
+newest list: ~8 degrees at 500 deg/s, measured as the trace's `extra`):
+- **Room clip rectangles stayed where the tick's camera put them.** bg.c draws
+  each room, and the props drawn with it, under a `G_SETSCISSOR` box: the screen
+  box of the portal the room is seen through (`bgScissorCurrentPlayerViewF`),
+  computed for the tick's camera. Turned, the room moves on screen and the box
+  does not: straight vertical cuts through rocks and props, sky behind them
+  (the maintainer's screenshot). `interp_on_scissor` now moves each box with
+  the displayed view: its corners are turned like the sky (exact for rotation)
+  and widened for the camera's movement (parallax, allowing for portals down to
+  100 units away); sides on the view's edge stay there; the player's whole view
+  (`bgScissorCurrentPlayerViewDefault`) is left alone; the result is clamped to
+  the player's viewport (split-screen). Only while the displayed view differs
+  from the tick's.
+- **The sky's edge refill missed the right and bottom edges, and skipped
+  corners at the horizon.** `skyClamp` stops a quarter pixel short of the right
+  and bottom edges (0.9984 in NDC), under the 0.999 the refill tested for, so a
+  right turn never stretched the sky back to the right edge (black, the clear
+  colour; tolerance now 0.995). And the fan is one quad whose lower corners are
+  the cloud plane's far cut (w ~ 230000) just above its horizon, clamped to the
+  screen with the w of the unclamped points, so only roughly coplanar: the
+  fitted plane put the right-edge point past its horizon whenever the view also
+  pitched down, and the refill skipped it, leaving the corner mid-screen (a
+  black wedge at ~1300 deg/s). Such a corner now keeps its edge point (the fan
+  below shares it) and its own depth.
+
+Not fixable at the render level: rooms and props the game culled for the tick's
+view (it decides visibility per tick, and that feeds game logic: the on-screen
+prop flag drives AI, chrai.c) are not in the display list, so in a very fast
+turn the leading edge of the predicted view can briefly show the sky where they
+would be. Not observed at 500 deg/s.
+
+Verified: synthetic mouse at 500, 900 and 1333 deg/s on Dam, every presented
+frame of 12 ticks inspected: no cut rocks, no missing sky, no horizon seam
+(before: cuts and black sky at 1333 deg/s, cuts in the maintainer's capture).
+`tools_pc/interptest.cpp`: case 7 now uses skyClamp's quarter-pixel corners and
+turns both ways (fails on the 0.999 tolerance), case 7b replays the captured
+Dam sky fan through 275 turns up to 48 degrees with -3..3 degrees of pitch (57
+corners short of the edge with the skip, 0 now), case 9 checks a moved clip box
+against the portal's true box under the turned view (< 0.05 px), the edge rule
+and the whole-view rule. Dam, Facility, Surface 1 walking with a 0-500 deg/s
+mouse and 2-player split-screen with P1 turning: 0 crashes, 0 replay
+divergences, static level geometry within 0.013 px.

@@ -57,7 +57,9 @@ static int initDone = 0;
  * at modern resolutions without requiring 4x anti-aliasing.
  */
 static int cfgVSync         = 1;   /* swap interval: 0 = off, 1 = on            */
-static int cfgFpsCap        = 60;  /* frame cap in fps; 0 = uncapped (vsync); menu only exposes 30/60 */
+static int cfgFpsCap        = 60;  /* frame cap in fps; 0 = uncapped (vsync); above 60 needs Video.Interpolation */
+static int cfgInterp        = 0;   /* D573: frame interpolation (extra frames between game ticks) */
+static int cfgInterpMouse   = 1;   /* D573: ...with mouse look predicted at the display rate */
 static int cfgMSAA          = 2;   /* 1/2/4/8/16 samples; 2x default is lighter on low-end GPUs */
 static int cfgTexFilter     = 1;   /* 0 = nearest, 1 = bilinear (default), 2 = N64 3-point + trilinear, 3 = trilinear (Trilinear option, playtest 2026-10-03) */
 static int cfgFixMipTex     = 1;   /* RC2: clip mip-contaminated texture uploads to base height */
@@ -80,6 +82,23 @@ static int cfgFullscreenMode = 0;  /* D511: fullscreen flavour, 0 = borderless d
 static int cfgDeckPresetApplied = 0; /* D283: 1 once the Steam Deck preset has been considered */
 static int cfgLowEndConsidered = 0;  /* D482: 1 once the low-end GPU defaults have been considered */
 static int cfgDefaultsRev = 0;       /* D546: 1 once the 2.5x -> 2.0x draw/LOD default migration ran */
+
+#define VIDEO_INTERP_SAFETY_FPS 500 /* D573: cap when interpolating with VSync off and no cap (PD's rule) */
+
+/* D573: interpolated frames are paced by VSync or the cap; with neither, an
+ * uncapped loop would redraw as fast as the GPU allows, so cap it. */
+static int videoEffectiveFpsCap(void)
+{
+    if (cfgInterp && !cfgVSync && cfgFpsCap == 0) {
+        return VIDEO_INTERP_SAFETY_FPS;
+    }
+    return cfgFpsCap;
+}
+
+/* In-between frames only help above the game's own rate: with a cap of 60 or
+ * less, interpolation would re-time the same frames (later and unevenly). */
+int videoInterpolationOn(void)        { return cfgInterp && (cfgFpsCap == 0 || cfgFpsCap > 60); }
+int videoInterpolationMouseLook(void) { return cfgInterpMouse; }
 
 /*
  * [Window] persistence. W/H = 0 -> auto (gfx_sdl2 fits a 4:3 window into ~85%
@@ -541,6 +560,8 @@ PD_CONSTRUCTOR static void videoConfigInit(void)
     configRegisterInt("Game.AllUnlocked", &portAllUnlocked, 0, 1);
     configRegisterInt("Video.VSync",         &cfgVSync,      0, 1);
     configRegisterInt("Video.FpsCap",        &cfgFpsCap,     0, 1000);
+    configRegisterInt("Video.Interpolation", &cfgInterp,     0, 1);   /* D573 */
+    configRegisterInt("Video.InterpolationMouseLook", &cfgInterpMouse, 0, 1);   /* D573 */
     configRegisterInt("Video.MSAA",          &cfgMSAA,       1, 16);   /* D443: 16x added */
     configRegisterInt("Video.TextureFilter", &cfgTexFilter,  0, 3);   /* Trilinear option (playtest 2026-10-03) */
     configRegisterInt("Video.FixMipTextures", &cfgFixMipTex, 0, 1);
@@ -860,6 +881,14 @@ void videoRequestLiveConfigForKey(const char *key)
     int mask = 0;
     if (!strcmp(key, "Video.VSync"))               mask = VCFG_VSYNC;
     else if (!strcmp(key, "Video.FpsCap"))          mask = VCFG_FPS;
+    else if (!strcmp(key, "Video.Interpolation")) {   /* D573 */
+        /* Turning it on with the default 60 (or 30) cap would change nothing:
+         * lift the cap to Uncapped (VSync-paced; safety-capped without VSync). */
+        if (cfgInterp && cfgFpsCap > 0 && cfgFpsCap <= 60) {
+            cfgFpsCap = 0;
+        }
+        mask = VCFG_FPS;
+    }
     else if (!strcmp(key, "Video.TextureFilter"))   mask = VCFG_FILTER;
     else if (!strcmp(key, "Video.FovScale"))        mask = VCFG_FOV;
     else if (!strcmp(key, "Video.Anisotropy"))      mask = VCFG_ANISO;
@@ -1075,7 +1104,7 @@ int videoInit(void)
         sysLogPrintf(LOG_WARNING, "video: Video.FpsCap=%d too low (throttles the sim); using 0 (uncapped)", cfgFpsCap);
         cfgFpsCap = 0;
     }
-    gfx_set_target_fps(cfgFpsCap);   /* 0 = uncapped */
+    gfx_set_target_fps(videoEffectiveFpsCap());   /* 0 = uncapped */
 
     /* Texture filtering. 1 = bilinear (default, matches prior behaviour),
      * 0 = crisp nearest, 2 = N64 3-point emulation + trilinear mips (opt-in;
@@ -1210,15 +1239,21 @@ static float videoOutputAspect(void)
     }
 }
 
-void videoStartFrame(void)
+/* D573: 1 while drawing an extra (interpolated) frame of a display list that
+ * was already drawn once: it is not a game frame, so it does not advance the
+ * frame counter (GE_PCDUMP / GE_QUITFRAME / probes count game frames). */
+static int s_subFrame = 0;
+
+static void videoStartFrameEx(int sub)
 {
     if (!initDone) {
         return;
     }
+    s_subFrame = sub;
     /* D344: enter the frame first, then check for a quit (see above). */
     SDL_AtomicSet(&s_inFrame, 1);
     /* D464: GE_MEMPREDZONE periodic stage-bank red-zone check (cached env). */
-    if (frames % 60 == 59) {
+    if (!sub && frames % 60 == 59) {
         extern void mempRedzoneCheck(const char *why);
         mempRedzoneCheck("videoEndFrame/60");
     }
@@ -1234,7 +1269,7 @@ void videoStartFrame(void)
     int dirty = SDL_AtomicSet(&liveCfgDirty, 0);
     if (dirty) {
         if (dirty & VCFG_VSYNC) wmAPI->set_swap_interval(cfgVSync ? 1 : 0);
-        if (dirty & VCFG_FPS) gfx_set_target_fps(cfgFpsCap);
+        if (dirty & (VCFG_FPS | VCFG_VSYNC)) gfx_set_target_fps(videoEffectiveFpsCap());   /* D573: VSync feeds the safety cap */
         if (dirty & VCFG_FILTER) videoApplyTexFilter();
         if (dirty & VCFG_FOV) portFovScale = cfgFovScale / 100.0f;
         if (dirty & VCFG_ANISO) gfx_set_anisotropy_level(cfgAniso);
@@ -1245,8 +1280,15 @@ void videoStartFrame(void)
     }
 
     gfx_set_output_aspect(videoOutputAspect());
-    gfx_start_frame();
+    if (sub) {
+        gfx_start_frame_no_events();   /* D573: see gfx_api.h */
+    } else {
+        gfx_start_frame();
+    }
 }
+
+void videoStartFrame(void)    { videoStartFrameEx(0); }
+void videoStartSubFrame(void) { videoStartFrameEx(1); }   /* D573 */
 
 /*
  * Host-thread SDL event pump.
@@ -1268,6 +1310,7 @@ void videoPumpEvents(void)
      * scheduler thread (must run here, on the window's creating thread). */
     videoDrainWindowRequests();
     inputApplyMouseRequests();   /* D287: mouse mode/cursor, same rule */
+    inputFakeMousePump();        /* D573 test probe (GE_INTERP_FAKEMOUSE); no-op unset */
     videoHostExitIfRequested();  /* D344: quit posted last pump or by another thread */
 
     SDL_Event ev;
@@ -1350,6 +1393,7 @@ void videoPumpEvents(void)
 
     /* D287: apply anything the events above (click-to-lock, focus) queued. */
     inputApplyMouseRequests();
+    inputPumpMouse();   /* D573: mouse motion for prediction, read on this thread */
 }
 
 /* D416: split-screen viewports are sub-rects; tell fast3d so its safe-area
@@ -1381,9 +1425,10 @@ void videoSubmitCommands(Gfx *cmds)
 static void videoPreSwapCapture(void)
 {
     /* GE_PCDUMP="first-last" / "first-last:step" -> ./ppm/frame_NNNNNN.ppm.
-     * Also honours [Debug] FrameDump in ge007.ini (env var wins). */
+     * Also honours [Debug] FrameDump in ge007.ini (env var wins). One dump per
+     * game frame: interpolated extra frames (D573) would overwrite it. */
     const char *pcdump = configGetFrameDump();
-    if (pcdump) {
+    if (pcdump && !s_subFrame) {
         static int lo = -1, hi = 0, step = 1;
         if (lo < 0) {
             const char *v = pcdump;
@@ -1399,6 +1444,30 @@ static void videoPreSwapCapture(void)
             snprintf(path, sizeof(path), "ppm/frame_%06d.ppm", (int)frames);
             gfx_opengl_dump_bound_fbo((uint32_t)gfx_current_window_dimensions.width,
                                       (uint32_t)gfx_current_window_dimensions.height, path);   /* D447: whole window, bars included */
+        }
+    }
+
+    /* D573 test probe: GE_INTERP_DUMP="first-last" dumps every presented frame
+     * of those game frames, interpolated ones included, as
+     * ppm/interp_NNNNNN_K.ppm (K = draw index within game frame NNNNNN). */
+    {
+        static int ilo = -2, ihi = 0, lastFrame = -1, k = 0;
+        if (ilo == -2) {
+            const char *v = getenv("GE_INTERP_DUMP");
+            ilo = -1;
+            if (v && sscanf(v, "%d-%d", &ilo, &ihi) == 2) {
+                GE_MKDIR("ppm");
+            } else {
+                ilo = -1;
+            }
+        }
+        if (ilo >= 0 && (int)frames >= ilo && (int)frames <= ihi) {
+            k = ((int)frames == lastFrame) ? k + 1 : 0;
+            lastFrame = (int)frames;
+            char path[128];
+            snprintf(path, sizeof(path), "ppm/interp_%06d_%d.ppm", (int)frames, k);
+            gfx_opengl_dump_bound_fbo((uint32_t)gfx_current_window_dimensions.width,
+                                      (uint32_t)gfx_current_window_dimensions.height, path);
         }
     }
 
@@ -1418,7 +1487,7 @@ static void videoPreSwapCapture(void)
     }
 }
 
-void videoEndFrame(void)
+static void videoEndFrameEx(int sub)
 {
     if (!initDone) {
         return;
@@ -1432,16 +1501,19 @@ void videoEndFrame(void)
         const char *q = getenv("GE_QUITFRAME");
         s_quitFrame = (q && atoi(q) > 0) ? atoi(q) : 0;
     }
-    if (s_quitFrame > 0 && frames + 1 >= (u32)s_quitFrame) {
+    if (!sub && s_quitFrame > 0 && frames + 1 >= (u32)s_quitFrame) {
         videoRequestQuit("GE_QUITFRAME");
     }
     if (SDL_AtomicGet(&s_quitReq)) {
         videoRenderPark();
     }
     SDL_AtomicSet(&s_inFrame, 0);
+    s_subFrame = 0;
 
-    ++frames;
-    ++fpsNumFrames;
+    if (!sub) {
+        ++frames;
+    }
+    ++fpsNumFrames;   /* presented frames, interpolated ones included */
 
     double now = wmAPI->get_time();
     if (fpsWindowStart == 0.0) {
@@ -1453,6 +1525,9 @@ void videoEndFrame(void)
         fpsWindowStart = now;
     }
 }
+
+void videoEndFrame(void)    { videoEndFrameEx(0); }
+void videoEndSubFrame(void) { videoEndFrameEx(1); }   /* D573 */
 
 float videoGetFPS(void)
 {
@@ -1517,5 +1592,10 @@ void videoCopyFramebuffer(s32 dst, s32 src, s32 left, s32 top)
 
 void videoResetTextureCache(void)
 {
+    /* D573: called on the game thread at a stage load; with frame
+     * interpolation the render worker may still be redrawing the last list
+     * from this same cache -- stop it first (heap corruption otherwise). */
+    extern void portRenderQuiesce(void);
+    portRenderQuiesce();
     gfx_texture_cache_clear();
 }
